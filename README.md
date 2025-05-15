@@ -1,7 +1,7 @@
 ## About This Project
 
 **Predicting Spotify: A Data Story about Quantifying Taste in Music**  
-*Group 20 – Anushka Goyal · Jingyao Zhu · Leo Chang · Mohammadreza Divsalar*
+
 
 We set out to understand what makes a song successful on Spotify by marrying rich audio-feature data with artist metrics and temporal context. Our workflow is split into two phases:
 
