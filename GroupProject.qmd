@@ -1,0 +1,1107 @@
+---
+title: "Decoding Music Popularity: Spotify Data Insights"
+author: "Anushka Goyal, Jingyao Zhu, Leo Chang, Mohammadreza Divsalar"
+output: html_document
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+Sys.setlocale("LC_TIME", "English")
+knitr::opts_chunk$set(
+  echo = FALSE,
+  fig.align = "center", 
+  out.width = "70%",
+  out.height = "70%"
+  )
+options(warn = -1)
+options(message = FALSE)
+
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+library(dplyr)
+library(lubridate)
+library(caret)
+library(lme4)
+library(broom)
+library(knitr)
+library(sjPlot)
+library(viridis)
+library(scales)
+library(fmsb)
+library(viridisLite)
+library(xgboost)
+library(pbapply)
+library(SHAPforxgboost)
+library(ggbeeswarm)
+library(data.table)
+library(viridis)
+library(tm)
+library(stringr)
+library(DALEX)
+```
+
+
+
+## 1. Introduction 
+
+In the ever-evolving landscape of the music industry, understanding the factors that contribute to a song's popularity is crucial for artists, producers, and streaming platforms alike. With the rise of digital streaming services like Spotify, vast amounts of data on music consumption and listener preferences have become available, offering unprecedented opportunities to analyze and predict what makes a song successful. 
+
+Using a dataset of 30,000 Spotify songs, we address two key questions:
+
+- For artists and producers: What combination of musical elements (tempo, key, energy, etc.) maximizes a song's potential for popularity?
+
+- For streaming platforms: How to derive more nuanced content acquisition and recommendation strategies based on patterns in popular songs?
+
+Our analysis is divided into two main parts: Exploratory Data Analysis (EDA) and Predictive Modeling. In the EDA phase, we explored the relationships between various features and track popularity, identifying trends and patterns that may contribute to a song's success. We then built an XGBoost model to predict track popularity based on these features and used SHAP (SHapley Additive exPlanations) analysis to interpret the model's predictions and understand the contribution of each feature. Bring them together, we finally derived actionable insights for music producers and streaming platforms to optimize their strategies for creating, acquiring and promoting popular music.
+
+By leveraging these insights, stakeholders in the music industry can make more informed decisions to enhance their competitive edge in a rapidly changing market.
+
+## 2. Dataset
+```{r}
+data = read_csv("data/spotify_songs_updated.csv", show_col_types = FALSE)
+
+# Extract the first four characters and convert to numeric
+data$release_yr <- as.numeric(substr(data$track_album_release_date, 1, 4))
+data <- data |> select(-track_album_release_date)
+data$duration_sec <- data$duration_ms / 1000
+```
+
+
+
+The [30000 Spotify Songs dataset](https://www.kaggle.com/datasets/joebeachcapital/30000-spotify-songs) from Kaggle contains detailed information on 30,000 songs from Spotify, including various music features and metadata. The main target variable, `track_popularity`, is a normalized metric (0-100) calculated by Spotify's internal algorithms to reflect the popularity of each song.
+
+In the music industry, an artist's fame can significantly influence the performance of their subsequent works. To control for this effect, we extracted `artist_popularity` and `artist_followers` as proxy variables for artist fame via Spotify API (along with`artist_genres`). If a song had multiple artists, we used the data of the first artist listed for simplicity.  
+
+The final dataset (`./data/spotify_songs_updated.csv`) includes both the original music features and the added artist-related features. A brief introduction of the dataset is given in the table below:
+
+Table 1: Description of the Dataset
+<div style="overflow-x: auto; max-width: 100%; height: 300px;">
+
+| Variable Name         | Variable Type   | Description                                                                 |
+|-----------------------|-----------------|-----------------------------------------------------------------------------|
+| `track_id`            | String          | Unique identifier for the song.                                             |
+| `track_name`          | String          | Name of the song.                                                           |
+| `track_artist`        | String          | Name of the artist(s) of the song.                                           |
+| `track_popularity`    | Integer         | Popularity of the song, calculated by Spotify's algorithm (0-100).          |
+| `track_album_id`      | String          | Unique identifier for the album containing the song.                        |
+| `track_album_name`    | String          | Name of the album containing the song.                                       |
+| `track_album_release_date` | String | Release date of the album (YYYY-MM-DD).                                     |
+| `playlist_name`       | String          | Name of the playlist where the song is found.                                |
+| `playlist_id`         | String          | Unique identifier for the playlist.                                         |
+| `playlist_genre`      | String          | Genre of the playlist.                                                      |
+| `playlist_subgenre`   | String          | Subgenre of the playlist.                                                   |
+| `danceability`        | Numeric         | Danceability of the song (0-1), higher values indicate easier dancing.       |
+| `energy`              | Numeric         | Energy level of the song (0-1), higher values indicate more energetic.       |
+| `key`                 | Integer         | Musical key of the song (-1-11, C=0, C#=1, ..., B=11, no key=-1).                        |
+| `loudness`            | Numeric         | Loudness of the song in decibels (dB).                                      |
+| `mode`                | Integer         | Mode of the song (0=minor, 1=major).                                        |
+| `speechiness`         | Numeric         | Speechiness of the song (0-1), higher values indicate more spoken words.     |
+| `acousticness`        | Numeric         | Acousticness of the song (0-1), higher values indicate more acoustic.        |
+| `instrumentalness`    | Numeric         | Instrumentalness of the song (0-1), higher values indicate more instrumental.|
+| `liveness`            | Numeric         | Liveness of the song (0-1), higher values indicate more live performance.    |
+| `valence`             | Numeric         | Positivity of the song (0-1), higher values indicate more positive.          |
+| `tempo`               | Numeric         | Tempo of the song in beats per minute (BPM).                                 |
+| `duration_ms`         | Numeric         | Duration of the song in milliseconds.                                       |
+| `artist_id`           | String          | Unique identifier for the artist.                                           |
+| `artist_followers`    | Integer         | Number of followers of the artist on Spotify.                               |
+| `artist_popularity`   | Integer         | Popularity of the artist, calculated by Spotify's algorithm (0-100).        |
+| `artist_genres`       | String          | Genres associated with the artist.                                          |
+</div>
+
+
+
+
+## 3. EDA
+### 3.1 Preprocessing
+1. Track duplicates & genre encoding
+
+The dataset has 32,833 observations with 28,356 unique tracks. Duplicates occur because one track can appear in different playlists with different `playlist_genres`. To remove duplicates while still retaining genre information, a new field, `track_genre`, was created by unifying data from `playlist_genre` and `artist_genres`. For each track, the most frequent overlapping genre between these two fields was selected. Compound genres like "pop rock" were split into individual terms (e.g., "pop" and "rock"). In cases where no overlap existed, the most frequent genre from `playlist_genre` was assigned.
+
+```{r}
+# Function to split genres into individual words, convert to lowercase, and count frequencies
+split_and_count <- function(genres) {
+  genres <- tolower(genres)
+  # Split into words
+  words <- unlist(str_split(genres, ", | "))
+  word_counts <- table(words)
+  return(word_counts)
+}
+
+# Function to find the most frequent overlapping word or the most frequent word in playlist_genres
+find_genre <- function(playlist_genres, artist_genres) {
+  # Split playlist genres into words and count frequencies
+  playlist_word_counts <- split_and_count(playlist_genres)
+  
+  # Split artist genres into words and count frequencies
+  artist_word_counts <- split_and_count(artist_genres)
+  
+  # Find overlapping words and their counts
+  overlap_counts <- playlist_word_counts[intersect(names(playlist_word_counts), names(artist_word_counts))]
+  
+  # If there are overlapping words, return the most frequent one
+  if (length(overlap_counts) > 0) {
+    return(names(which.max(overlap_counts)))
+  }
+  
+  # If no overlapping words, return the most frequent word in playlist_genres
+  return(names(which.max(playlist_word_counts)))
+}
+
+# Create the new genre field
+data <- data %>%
+  group_by(track_id) %>%
+  mutate(
+    playlist_genres_duplicated = paste(playlist_genre, collapse = ", "),
+    track_genre = ifelse(
+      is.na(artist_genres) | artist_genres == "",
+      names(which.max(split_and_count(playlist_genres_duplicated))),
+      find_genre(playlist_genres_duplicated, artist_genres)
+    )
+  ) %>%
+  ungroup() %>%
+  select(-playlist_genres_duplicated)  # Remove the temporary column
+```
+
+
+
+
+```{r}
+unique_tracks_cnt <- n_distinct(data$track_id)
+
+data <- data %>%
+  distinct(track_id, .keep_all = TRUE)
+```
+
+2. Missing values & outliers
+
+```{r include=FALSE}
+data %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+Missing values were found in `artist_id` (9 rows) and `artist_popularity`/`artist_followers` (10 rows). As these variables are critical for analyzing a song's success, affected rows were removed for data quality.
+
+```{r include=FALSE}
+data <- data %>%
+  filter(!is.na(artist_id) & !is.na(artist_popularity) & !is.na(artist_followers))
+
+print(paste("Current row count:", nrow(data)))
+```
+
+```{r}
+numeric_features <- c(
+  "release_yr", "danceability", "energy", "loudness", 
+  "speechiness", "acousticness", "instrumentalness", "liveness", 
+  "valence", "tempo", "duration_sec", "artist_followers", "artist_popularity"
+)
+```
+
+
+```{r include=FALSE}
+
+detect_outliers <- function(data, feature) {
+  Q1 <- quantile(data[[feature]], 0.25, na.rm = TRUE)
+  Q3 <- quantile(data[[feature]], 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  outliers <- data %>%
+    filter((!!sym(feature)) < lower_bound | (!!sym(feature)) > upper_bound)
+  return(list(outliers = outliers, lower_bound = lower_bound, upper_bound = upper_bound))
+}
+
+
+outliers_summary <- list()
+for (feature in numeric_features) {
+  result <- detect_outliers(data, feature)
+  outliers_summary[[feature]] <- result
+  cat("Feature:", feature, "\n")
+  cat("Lower Bound:", result$lower_bound, "\n")
+  cat("Upper Bound:", result$upper_bound, "\n")
+  cat("Number of Outliers:", nrow(result$outliers), "\n")
+  cat("\n")
+}
+```
+
+
+```{r include=FALSE}
+features_to_plot <- c("release_yr", "speechiness", "instrumentalness", "artist_followers")
+
+plots <- list()
+
+
+for (feature in features_to_plot) {
+  p <- ggplot(data, aes_string(x = feature)) + 
+    geom_histogram(binwidth = if (feature == "artist_followers") 100000 else 0.1, 
+                   fill = "blue", color = "black", alpha = 0.7) +
+    labs(title = feature, x = feature, y = "Frequency") +
+    theme_minimal()
+  plots[[feature]] <- p
+}
+
+plots[["artist_followers"]] <- ggplot(data, aes_string(x = "artist_followers")) + 
+  geom_histogram(binwidth = 100000, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "artist_followers", x = "artist_followers", y = "Frequency") +
+  theme_minimal()
+
+
+plot_layout <- (plots[[1]] | plots[[2]] | plots[[3]] | plots[[4]]) +
+  plot_annotation(title = "Histograms of Selected Features") +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+
+# Print the combined plot
+print(plot_layout)
+```
+
+
+
+```{r}
+data$decade <- floor(data$release_yr / 10) * 10
+data <- data %>%
+  filter(decade >= 1960)
+```
+
+
+```{r}
+p1 <- ggplot(data, aes(x = artist_followers)) +
+  geom_histogram(binwidth = 100000, fill = "#A0C9E6", color = "black", alpha = 0.7) +
+  labs(title = "Distribution: \nArtist Followers",
+       x = "Artist Followers",
+       y = "Frequency") +
+  theme_minimal() +
+  theme(aspect.ratio = 1.2)
+
+p2 <- ggplot(data, aes(x = artist_popularity)) +
+  geom_histogram(binwidth = 5, fill = "#A0C9E6", color = "black", alpha = 0.7) +
+  labs(title = "Distribution: \nArtist Popularity",
+       x = "Artist Popularity",
+       y = "Frequency") +
+  theme_minimal() + 
+  theme(aspect.ratio = 1.2)
+```
+
+
+
+```{r}
+p3 <- ggplot(data, aes(x = artist_popularity, y = log(artist_followers+1), color = track_popularity)) +
+  geom_point(alpha = 0.6) +  
+  scale_color_viridis(option = "plasma") +  
+  labs(title = "Artist Popularity \nvs Artist Followers", 
+       x = "Artist popularity", y = "log(Followers)", color = "Track popularity") +
+  theme_minimal(base_size = 10) +
+  theme(aspect.ratio = 1.2) + 
+  theme(legend.position = "top") +
+  guides(fill = guide_legend(nrow = 2))
+
+```
+
+Given the dataset's standardized features, most outliers beyond the 1.5QTR bounds cannot be easily removed. However, from a business standpoint, three specific manipulations were applied: 
+
+- **Release year**: songs released in 1950s are very sparse (only 3 observations). Thus, we delete them. 
+
+- **Speechiness**: Rows with `speechiness > 0.66` (pure talk or audiobooks) were removed. 
+
+- **Artist popularity indicators**: 
+
+```{r}
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+The distribution of `artist_followers` exhibits a power-law pattern, with most artists having minimal followers. A strong linear relationship was observed between `artist_popularity` and `log(artist_followers)`. While `artist_followers` remains a key metric, purely cold-start artists (`artist_popularity = 0`) were removed. These artists lack sufficient user behavior data to provide meaningful popularity calculation evidence and may not actively participate in market dynamics.
+
+```{r}
+data <- data %>%
+  filter(speechiness <= 0.66 & artist_popularity > 0)
+```
+
+
+### 3.2 Static Analysis
+
+1. Association between key/mode and track popularity
+
+```{r}
+key_names <- c("No Key", "C", "C♯/D♭", "D", "D♯/E♭", "E", "F", "F♯/G♭", "G", "G♯/A♭", "A", "A♯/B♭", "B")
+
+# Convert the key column to musical pitch names
+data$key_name <- factor(key_names[data$key + 2], levels = key_names)  # Adding 2 to map -1 to "No Key"
+
+# Map mode to labels: "Minor" for mode 0 and "Major" for mode 1
+data$mode_name <- factor(data$mode, levels = c(0, 1), labels = c("Minor", "Major"))
+
+
+# Plot using custom colors
+p1 <- ggplot(data, aes(x = key_name, y = track_popularity, fill = mode_name)) +
+  geom_boxplot() +
+  scale_fill_viridis(option = "plasma", discrete = TRUE, alpha = 0.4) + 
+  labs(title = "Popularity Distribution by Key and Mode", x = "Key", y = "Popularity", fill = "Mode") +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "top") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+
+p2 <- ggplot(data, aes(x = track_popularity, fill = mode_name)) +
+  geom_density(alpha = 0.4, adjust = 1) +
+  scale_fill_viridis(option = "plasma", discrete = TRUE) +
+  labs(title = "Popularity Distribution \nby Mode", 
+       x = "Popularity", 
+       y = "Density", 
+       fill = "Mode") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top") +
+  theme(aspect.ratio = 1.5)
+
+grid.arrange(p1, p2, ncol = 2, widths = c(6, 4))
+```
+
+
+Mode determines the emotional tone (major for brighter, minor for darker tones) for a track. From the plots above, we observe a general tilt toward major keys being more popular despite few key exceptions like C, C# and G. In the density plot, major-mode tracks are more densely clustered in higher-popularity intervals compared to their minor counterparts. This reflects listener preference for uplifting music. (2) In contrast, the choice of key (e.g., C, D, E) shows little direct association with popularity, as keys can be shifted without altering a track's emotional core. 
+
+Overall, mode may be a more critical factor in shaping popularity, while key is less influential.
+
+2. Association between temporal features (tempo and duration) and popularity
+```{r out.width="60%", out.height="60%"}
+data$tempo_bin <- cut(data$tempo, 
+                      breaks = c(0, 80, 110, 140, Inf), 
+                      labels = c("Slow \n(0-80)", "Moderately Slow \n(80-110)", "Moderately Fast \n(110-140)", "Fast \n(140+)"), 
+                      include.lowest = TRUE)
+data$tempo_bin <- factor(data$tempo_bin, levels = c("Slow \n(0-80)", "Moderately Slow \n(80-110)", "Moderately Fast \n(110-140)", "Fast \n(140+)"))
+
+data$duration_bin <- cut(data$duration_sec, 
+                         breaks = c(0, 150, 210, 270, 330, Inf),  
+                         labels = c("Very Short \n(0-150)", "Short \n(150-210)", "Medium \n(210-270)", "Long \n(270-330)", "Very Long \n(330+)"),
+                         include.lowest = TRUE)
+data$duration_bin <- factor(data$duration_bin, levels = c("Very Short \n(0-150)", "Short \n(150-210)", "Medium \n(210-270)", "Long \n(270-330)", "Very Long \n(330+)"))
+
+data_filtered <- data %>% filter(track_popularity <= 90)
+
+data_filtered$popularity_bin <- cut(data_filtered$track_popularity, 
+                                    breaks = seq(0, 90, by = 1), 
+                                    include.lowest = TRUE, 
+                                    right = FALSE)
+
+data_percent <- data_filtered %>%
+  group_by(popularity_bin, tempo_bin) %>%
+  summarise(count = n(), .groups = "drop") %>%  
+  group_by(popularity_bin) %>%
+  mutate(percent = count / sum(count)) %>%  
+  ungroup()
+
+data_percent$popularity_bin <- as.numeric(sub("\\[([0-9]+),.*", "\\1", as.character(data_percent$popularity_bin)))
+
+p1 <- ggplot(data_percent, aes(x = popularity_bin, y = percent, fill = tempo_bin)) +
+  geom_area(position = "fill", alpha = 0.75) +  
+  scale_fill_viridis(option = "plasma", discrete = TRUE) +  
+  labs(title = "Stacked Percentage Distribution \nof Popularity by Tempo Bin", 
+       x = "Popularity", 
+       y = "Percentage") + 
+  theme_minimal(base_size = 10) + 
+  theme(legend.position = "top") +
+  guides(fill = guide_legend(nrow = 2))
+
+
+data_percent <- data_filtered %>%
+  group_by(popularity_bin, duration_bin) %>%
+  summarise(count = n(), .groups = "drop") %>%  
+  group_by(popularity_bin) %>%
+  mutate(percent = count / sum(count)) %>% 
+  ungroup()
+
+data_percent$popularity_bin <- as.numeric(sub("\\[([0-9]+),.*", "\\1", as.character(data_percent$popularity_bin)))
+
+p2 <- ggplot(data_percent, aes(x = popularity_bin, y = percent, fill = duration_bin)) +
+  geom_area(position = "fill", alpha = 0.75) +  
+  scale_fill_viridis(option = "plasma", discrete = TRUE) +  
+  labs(title = "Stacked Percentage Distribution \nof Popularity by Duration Bin", 
+       x = "Popularity", 
+       y = "Percentage") + 
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "top") +
+  guides(fill = guide_legend(nrow = 2))
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+Based on musical conventions, we categorized tempo and duration into several ranges (as shown in the legends). We then plotted stacked percentage area plots to show the proportion of each range across different levels of track popularity: (1) **Tempo**: The share of **Fast (>140 bpm)** and **Moderately Slow (80~110 bpm)** tracks increases when track popularity exceeds 75, indicating a listener preference for either up-beat or relaxed songs. (2) **Duration**: Short tracks (150-210 seconds) dominate the high-popularity range (>75), reflecting a trend toward concise and easily consumable content.
+
+
+3. Association between other audio features and track popularity
+```{r}
+data <- data %>%
+  filter(!is.na(track_popularity)) %>%
+  mutate(popularity_group = cut(track_popularity, 
+                                breaks = c(-Inf,25, 50, 75, Inf),  
+                                labels = c("Low", "Medium-Low", "Medium-High", "High"),
+                                include.lowest = TRUE))
+
+
+features_avg <- data %>%
+  group_by(popularity_group) %>%
+  summarise(across(c(danceability, energy, loudness, speechiness, acousticness, instrumentalness, liveness, valence), mean, na.rm = TRUE)) %>%
+  drop_na()  
+
+
+normalize <- function(x) (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+features_avg[,-1] <- as.data.frame(lapply(features_avg[,-1], normalize))
+
+
+radar_data <- as.data.frame(features_avg)
+radar_data <- radar_data %>% filter(!is.na(popularity_group)) 
+row.names(radar_data) <- radar_data$popularity_group 
+radar_data <- radar_data[,-1]
+
+radar_data <- rbind(rep(1, ncol(radar_data)), rep(0, ncol(radar_data)), radar_data)
+
+viridis_colors <- viridis(option = "plasma", n = 4)  
+radarchart(radar_data, axistype = 2, 
+           pcol = viridis_colors, 
+           pfcol = alpha(viridis_colors, 0.3),  
+           plwd = 2,  
+           cglcol = "grey", cglty = 1, cglwd = 0.8,  
+           axislabcol = "black",
+           vlcex = 1,  
+           title = "Average Music Feature by Popularity Group")
+
+par(xpd = TRUE)
+legend(1.5, 1, legend = c("Low\n(≤25)", "Medium-Low\n(25-50)", "Medium-High\n(50-75)", "High\n(>75)"), 
+       col = viridis_colors, lwd = 2,  bty = "n", cex = 1, y.intersp = 1.5)
+
+
+```
+We split popularity into four equal bins and used radar charts to show average audio features per bin: (1) **Positive Associations**: Higher popularity tracks tend to exhibit higher **danceability**, **acousticness**, and **loudness**. (2) **Negative Associations**: Lower **instrumentalness**, **energy**, and **liveness** are linked to higher popularity, indicating a preference for tracks with more vocal presence and less live or instrumental content. (3) **Speechiness**: While the highest popularity group shows elevated **speechiness**, the gap with other groups is large, so this relationship needs to be examined more carefully. (4) **Valence**: The association between **valence** (musical positivity) and popularity is ambiguous, showing no clear pattern.
+
+
+### 3.3 Dynamic Analysis
+Since popularity metrics are time-sensitive, in this section, we start to include the release year of songs to capture some time patterns associated with track popularity.
+```{r}
+data$track_genre <- factor(data$track_genre)
+data$decade <- floor(data$release_yr / 10) * 10
+
+data_avg_popularity_decade <- data %>%
+  group_by(track_genre, decade) %>%
+  summarise(avg_popularity = mean(track_popularity, na.rm = TRUE), .groups = "drop") %>%  
+  ungroup()
+
+p2 <- ggplot(data_avg_popularity_decade, aes(x = decade, y = avg_popularity, color = track_genre, group = track_genre)) +
+  geom_line(size = 1) +  
+  geom_point(size = 2) +  
+  scale_color_viridis(discrete = TRUE, option = "plasma") +  
+  labs(title = "Average Track Popularity by Genre and Decade", x = "Release Decade", y = "Average Popularity") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(legend.position = "top")
+
+```
+
+```{r}
+data <- data %>%
+  mutate(decade = floor(release_yr / 10) * 10)
+
+
+data_avg_popularity_decade <- data %>%
+  group_by(track_genre, decade) %>%
+  summarise(avg_popularity = mean(track_popularity, na.rm = TRUE), .groups = "drop")
+
+
+data_overall_trend <- data %>%
+  group_by(release_yr) %>%
+  summarise(
+    mean_popularity = mean(track_popularity, na.rm = TRUE),
+    sd_popularity = sd(track_popularity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+p2 <- ggplot() +
+  geom_ribbon(data = data_overall_trend, 
+              aes(x = release_yr, ymin = mean_popularity - sd_popularity, ymax = mean_popularity + sd_popularity),
+              fill = "#A0C9E6", alpha = 0.2) +  
+  geom_line(data = data_avg_popularity_decade, 
+            aes(x = decade, y = avg_popularity, color = track_genre, group = track_genre),
+            size = 1) +
+  geom_point(data = data_avg_popularity_decade,
+             aes(x = decade, y = avg_popularity, color = track_genre),
+             size = 2) +
+  scale_color_viridis(discrete = TRUE, option = "plasma") +
+  labs(title = "Average Track Popularity by Genre and Decade",
+       x = "Decade",
+       y = "Average Popularity") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+```
+
+
+```{r include=FALSE}
+genre_decade_distribution <- data %>%
+  group_by(decade, track_genre) %>%
+  summarise(count = n(), .groups = 'drop')
+
+data_avg_popularity_decade <- data %>%
+  group_by(track_genre, decade) %>%
+  summarise(avg_popularity = mean(track_popularity, na.rm = TRUE), .groups = "drop")
+
+combined_data <- genre_decade_distribution %>%
+  left_join(data_avg_popularity_decade, by = c("decade", "track_genre"))
+
+scale_factor = 250
+
+p3 <- ggplot(combined_data) +
+  geom_bar(aes(x = as.factor(decade), y = count, fill = track_genre), 
+           stat = "identity", position = "stack", width = 0.8, alpha = 0.8) +
+  geom_line(aes(x = as.factor(decade), y = avg_popularity * scale_factor, 
+                color = track_genre, group = track_genre), 
+            size = 0.8, alpha = 1) +
+  geom_point(aes(x = as.factor(decade), y = avg_popularity * scale_factor, 
+                 color = track_genre), 
+             size = 1.6) +
+  scale_y_continuous(
+    name = "Number of Songs",
+    sec.axis = sec_axis(~ . / scale_factor, name = "Average Popularity")
+  ) +
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  scale_color_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  labs(
+    x = "Decade",
+    fill = "Genre",
+    color = "Track Genre (Line)",
+    title = "Genre Distribution and Average Popularity by Decade"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),  
+    legend.position = "top",  
+    plot.title = element_text(hjust = 0.5, size = 12)  
+  )+
+  guides(
+    fill = guide_legend(),
+    color = FALSE) 
+```
+
+```{r}
+p1 <- ggplot(genre_decade_distribution) +
+  geom_bar(aes(x = as.factor(decade), y = count, fill = track_genre), 
+           stat = "identity", position = "stack", width = 0.8, alpha = 0.8) +
+  scale_y_continuous(name = "Number of Songs") +
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +
+  labs(
+    x = "Decade",
+    fill = "Genre",
+    title = "Genre Distribution by Decade"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),  
+    legend.position = "top",  
+    plot.title = element_text(hjust = 0.5, size = 12)  
+  ) +
+  guides(fill = guide_legend())  
+
+```
+
+
+
+
+
+```{r}
+data_summary <- data %>%
+  group_by(release_yr, track_genre) %>%
+  summarise(count = n(),  
+            avg_popularity = mean(track_popularity, na.rm = TRUE), .groups = "drop") %>%  
+  ungroup()
+
+
+p3 <- ggplot(data_summary, aes(x = release_yr, y = count, fill = avg_popularity)) +
+  geom_bar(stat = "identity", position = "stack", width = 1) +  
+  facet_wrap(~ track_genre, nrow = 2, scales = "free_y") + 
+  scale_fill_viridis_c(option = "plasma") +  
+  labs(title = "Release Year Distribution by Genre with Average Track Popularity",
+       x = "Release Year",
+       y = "Count",
+       fill = "Average Popularity") +  
+  theme_minimal(base_size = 10) +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        legend.position = "top")  
+```
+1. Relationship between genre, release year, and track popularity
+
+```{r}
+grid.arrange(p1, p2, ncol = 2)
+```
+The rise and fall of music genres are closely tied to time. The left chart shows the release year distribution of six major genres: rock has a balanced distribution across decades, while modern genres like pop, rap, and Latin emerged prominently post-1990s, with the majority of EDM appearing around 2010.
+
+The right chart illustrates the average popularity trends of these genres by release decade. Overall, popularity first declined and then rebounded: from 1960 to 2000, average popularity dropped, but post-2000, it rose—a trend that contradicts the expected decay over time. This anomaly can be explained by two possible reasons:
+
+- **Selection bias**: only iconic tracks from earlier decades remain in the dataset, while less popular songs have been eliminated. 
+
+- **Retro sentiment**: the increased popularity of older songs due to nostalgia, cultural revival, or perceived timeless quality.
+
+
+```{r}
+print(p3)
+```
+
+From the genre-specific release year distribution chart (color-coded by popularity), we observe four distinct patterns in current popularity trends as release years progress: (1) Steady Rise: Pop, Latin; (2) Delayed Surge: R&B, Rap; (3) Emerging Growth: EDM; (4) Decline: Rock.
+
+Rock stands out as a unique genre in two folds: (1) First, it emerged early, dominating the pre-1980s market, and pre-1980s rock tracks maintain high popularity today, even compared to modern genres. (2) However, post-2010 rock tracks show significantly lower popularity, both compared to earlier rock and other genres that are gaining popularity.
+
+
+To explore this phenomenon, we guess that, in addition to a potential retro sentiment, changes in the audio features of rock music itself may play a role.
+
+
+2. Audio feature evolution
+
+We compared the trends of audio features (e.g., danceability, energy) over time between rock and pop—a representative of the steady riser genres and found two major differences:
+```{r}
+selected_genres <- c("rock", "pop") 
+genre_data <- data %>%
+  filter(track_genre %in% selected_genres) %>%  
+  mutate(decade = floor(release_yr / 10) * 10) %>%  
+  group_by(decade, track_genre) %>%  
+  summarise(
+    energy = mean(energy, na.rm = TRUE),
+    loudness = mean(loudness, na.rm = TRUE), 
+    instrumentalness = mean(instrumentalness, na.rm = TRUE),
+    speechiness = mean(speechiness, na.rm = TRUE),
+    danceability = mean(danceability, na.rm = TRUE),
+    acousticness = mean(acousticness, na.rm = TRUE),
+    liveness = mean(liveness, na.rm = TRUE),
+    tempo = mean(tempo, na.rm = TRUE),        
+    duration = mean(duration_sec, na.rm = TRUE), 
+    .groups = "drop"  
+  ) %>%
+  ungroup()
+
+genre_data_long <- genre_data %>%
+  pivot_longer(cols = -c(decade, track_genre), 
+               names_to = "metric", 
+               values_to = "value")
+
+ggplot(genre_data_long, 
+       aes(x = decade, y = value, 
+           color = track_genre, 
+           shape = track_genre,
+           group = track_genre)) +
+  geom_line(size = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ metric, ncol = 3, scales = "free_y") +  
+  scale_color_viridis_d(option = "plasma", begin = 0.1, end = 0.9) +  
+  scale_shape_manual(values = c(15, 16, 17, 18, 8, 3)) +
+  labs(title = "Music Feature Evolution by Genre",
+       x = "Decade",
+       y = "Feature Value",
+       color = "Genre",
+       shape = "Genre") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+```
+
+Between 1980 and today, rock's acousticness has significantly decreased, while its energy has increased more than pop's. This shift suggests modern rock has become "heavier," favoring intensity over expressiveness and texture. This aligns with our findings in Section 3.2, where acousticness is potentially positively associated with popularity, while energy acts in opposite direction.
+
+
+## 4. Modelling
+### 4.1 Method
+
+To further validate the relationship between features and popularity, we used XGBoost, a gradient boosting algorithm, to predict track popularity based on the features in Table 2. Following this, we applied SHAP analysis to uncover the direction and magnitude of each feature's potential impact on track popularity. We did not use GAM models since it requires extensive tuning to handle nonlinearities, and our computational resources were limited.
+
+Table 2: Features and Target Used in Modeling
+
+| **Category**            | **Variables**                                                                 |
+|-------------------------|------------------------------------------------------------------------------|
+| **Audio Features**      | `danceability`, `energy`, `loudness`, `speechiness`, `acousticness`, `instrumentalness`, `liveness`, `valence`, `tempo`, `duration_sec`, `key` (categorical), `mode` (categorical) |
+| **Metadata**            | `release_yr`, `track_genre` (categorical)                                   |
+| **Artist Features**     | `artist_popularity`, `artist_followers`                                     |
+| **Target Variable**     | `track_popularity`                                                          | 
+
+
+The dataset was randomly split into training (80%) and testing (20%). On the training set, a random search was conducted to optimize key hyperparameters, including `eta`, `gamma`, `max_depth`, `min_child_weight`, and `n_estimators`. The search aimed to minimize average RMSE using 5-fold cross validation, with a 20% random subsample of the training data used on each fold for efficiency. The optimal hyperparameters were: {`eta`: 0.025, `gamma`: 0.7, `max_depth`: 5, `min_child_weight`: 5, `n_estimators`: 300}. The final XGBoost model was trained on the full training set using these optimized hyperparameters. 
+
+
+```{r}
+
+data <- data %>%
+  mutate(
+    key = as.factor(key),
+    track_genre = as.factor(track_genre)
+  )
+
+dummy_model <- dummyVars(~ key + track_genre, data = data)
+dummy_data <- predict(dummy_model, newdata = data)  
+
+dummy_data <- as.data.frame(dummy_data)
+data <- cbind(data, dummy_data)
+```
+
+
+
+```{r}
+features <- c("mode", "danceability", "energy", "loudness", "speechiness", "acousticness", "instrumentalness", "liveness", "valence", "tempo", "duration_sec", "release_yr", "artist_popularity", "artist_followers", "track_genre.edm", "track_genre.latin", "track_genre.pop", "track_genre.r&b", "track_genre.rap", "track_genre.rock", "key.0", "key.1", "key.2", "key.3", "key.4", "key.5", "key.6", "key.7", "key.8", "key.9", "key.10", "key.11")
+target <- "track_popularity"
+
+data = data[c(features, target)]
+```
+
+```{r}
+set.seed(123)  # For reproducibility
+train_index <- createDataPartition(data[[target]], p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+```
+
+```{r include=FALSE}
+# set.seed(123)
+# sample_ratio <- 0.2
+# sampled_data <- train_data[sample(nrow(train_data), nrow(train_data) * sample_ratio), ]
+# 
+#
+# cross_validate <- function(model_func, params, train_data, features, target, n_folds = 5) {
+#   folds <- createFolds(train_data[[target]], k = n_folds)
+#   rmse_scores <- sapply(folds, function(fold_index) {
+#     cv_train <- train_data[-fold_index, ]
+#     cv_valid <- train_data[fold_index, ]
+#     model <- model_func(cv_train, cv_valid, features, target, params)
+#     predictions <- predict(model, as.matrix(cv_valid[, features]))
+#     rmse <- sqrt(mean((predictions - cv_valid[[target]])^2))
+#     r2 <- cor(predictions, cv_valid[[target]])^2
+#     c(rmse = rmse, r2 = r2)
+#   })
+#   return(list(rmse = mean(rmse_scores["rmse", ]), r2 = mean(rmse_scores["r2", ])))
+# }
+# 
+# 
+# train_xgb <- function(train_data, valid_data, features, target, params) {
+#   dtrain <- xgb.DMatrix(data = as.matrix(train_data[, features]), label = train_data[[target]])
+#   xgb.train(
+#     data = dtrain,
+#     params = list(
+#       objective = "reg:squarederror",
+#       max_depth = params["max_depth"],
+#       eta = params["eta"],
+#       gamma = params["gamma"],
+#       min_child_weight = params["min_child_weight"]
+#     ),
+#     nrounds = params["n_estimators"],
+#     verbose = 0
+#   )
+# }
+# 
+# 
+# param_xgb <- list(
+#   eta = runif(50, 0.001, 1),  
+#   gamma = runif(50, 0.001, 1),  
+#   max_depth = sample(2:10, 50, replace = TRUE),  
+#   min_child_weight = sample(2:10, 50, replace = TRUE), 
+#   n_estimators = sample(100:1000, 50, replace = TRUE)  
+# )
+# 
+#
+# param_df <- data.frame(param_xgb)
+# 
+#
+# xgb_results <- pbapply(param_df, 1, function(params) {
+#   result <- cross_validate(train_xgb, params, sampled_data, features, target)
+#   c(rmse = result$rmse, r2 = result$r2)
+# })
+# 
+#
+# xgb_results_df <- cbind(param_df, t(xgb_results))
+# 
+#
+# best_xgb <- xgb_results_df[which.min(xgb_results_df$rmse), ]
+# print(best_xgb)
+# 
+# 
+# p1 <- ggplot(xgb_results_df, aes(x = eta, y = max_depth, color = rmse)) +
+#   geom_point(size = 3, alpha = 0.8) +
+#   scale_color_gradient(low = "blue", high = "red") +
+#   labs(title = "eta vs max_depth (Color: RMSE)",
+#        x = "eta", y = "max_depth", color = "RMSE") +
+#   theme_minimal()
+# 
+# p2 <- ggplot(xgb_results_df, aes(x = n_estimators, y = rmse, color = eta)) +
+#   geom_point(size = 3, alpha = 0.8) +
+#   scale_color_gradient(low = "blue", high = "red") +
+#   labs(title = "n_estimators vs RMSE (Color: eta)",
+#        x = "n_estimators", y = "RMSE", color = "eta") +
+#   theme_minimal()
+# 
+# 
+# print(p1)
+# print(p2)
+```
+
+### 4.2 Results
+```{r include=FALSE}
+best_params <- list(
+  eta = 0.025,
+  gamma = 0.7,
+  max_depth = 5,
+  min_child_weight = 5,
+  n_estimators = 300
+)
+
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_data[, features]), label = train_data[[target]])
+
+
+cat("Training final model on the full training set...\n")
+final_model <- xgb.train(
+  data = dtrain,
+  params = list(
+    objective = "reg:squarederror",
+    eta = best_params$eta,
+    gamma = best_params$gamma,
+    max_depth = best_params$max_depth,
+    min_child_weight = best_params$min_child_weight
+  ),
+  nrounds = best_params$n_estimators,
+  verbose = 1 
+)
+
+
+dtest <- xgb.DMatrix(data = as.matrix(test_data[, features]), label = test_data[[target]])
+predictions <- predict(final_model, dtest)
+
+rmse <- sqrt(mean((predictions - test_data[[target]])^2))
+r2 <- cor(predictions, test_data[[target]])^2
+
+cat("Test set performance:\n")
+cat("RMSE:", rmse, "\n")
+cat("R2:", r2, "\n")
+
+results_df <- data.frame(
+  Actual = test_data[[target]],
+  Predicted = predictions
+)
+
+
+results_df$Error <- abs(results_df$Actual - results_df$Predicted)
+
+p <- ggplot(results_df, aes(x = Actual, y = Predicted, color = Error)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_viridis_c(option = "plasma", begin = 0.1, end = 0.9) +  
+  labs(title = "Actual vs Predicted",
+       x = "Actual Values",
+       y = "Predicted Values",
+       color = "Prediction Error") +
+  theme_minimal()
+
+```
+#### 4.2.1 Model Performance
+
+On the test set, the model achieved a test RMSE of 20.02 and an R² of 0.28. While the prediction performance is moderate, the model still captures some general patterns amidst the complex factors influencing a song's success.
+```{r include=FALSE}
+
+print(p)
+# Due to page limit, this part is discarded.
+# The actual vs. predicted plot reveals a clear pattern: the model tends to overestimate popularity in the low-popularity range, which aligns with expectations given the long-tail distribution of music consumption. Conversely, for highly popular tracks, predictions remain relatively high, suggesting the model successfully captures key patterns in hit songs. For a platform like Spotify, this means that instead of simply filtering out tracks misclassified as "predicted hits," a more nuanced promotional strategy could be designed. These overestimated low-popularity tracks may share common patterns with actual hits—suggesting that, with the right marketing push, they could break through. This highlights a potential opportunity to refine promotional strategies for long-tail music discovery rather than treating these cases as false positives.
+
+```
+
+
+
+
+#### 4.2.2 SHAP Analysis
+SHAP measures a feature's contribution to the model prediction. Unlike traditional methods that only provide average contributions, SHAP can be calculated for individual observations. By analyzing the relationship between SHAP values and feature values, we can determine how a feature influences the prediction—whether it increases (SHAP > 0) or decreases (SHAP < 0) the target for a given feature value.
+
+
+
+```{r}
+shap_values <- shap.values(xgb_model = final_model, X_train = as.matrix(train_data[, features]))
+
+shap_data <- shap_values$shap_score
+base_value <- shap_values$base_score
+```
+
+```{r}
+shap_data <- as.data.table(shap_data)
+
+mean_shap <- colMeans(abs(shap_data)) 
+feature_order <- names(sort(mean_shap, decreasing = TRUE)) 
+scaled_feature_values <- apply(train_data[, colnames(shap_data)], 2, function(x) (x - min(x)) / (max(x) - min(x)))
+
+plot_data <- list()
+
+for (feature in colnames(shap_data)) {
+  median_value <- median(scaled_feature_values[, feature])
+  
+  plot_data[[feature]] <- data.table(
+    feature = feature,
+    shap_value = shap_data[[feature]], 
+    feature_value_scaled = scaled_feature_values[, feature],
+    median_value = median_value
+  )
+}
+
+plot_data <- rbindlist(plot_data)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+plot_data[, feature := factor(feature, levels = feature_order)]
+
+top_n = 20
+plot_data = plot_data[plot_data$feature %in% feature_order[1:top_n]]
+
+plot_data[, alpha_value := (abs(feature_value_scaled - median_value) * 2) ^ 0.5]
+plot_data <- plot_data[order(alpha_value)]
+plot_data$feature <- factor(plot_data$feature, levels = rev(feature_order))
+p_beeswarm <- ggplot(plot_data, aes(x = shap_value, y = feature, color = feature_value_scaled, alpha = alpha_value)) +
+  geom_quasirandom(width = 0.3, size = 1.5) +  
+  scale_color_viridis(option = "plasma",  
+                      begin = 0.1, end = 0.9,  
+                      breaks = c(0, 0.5, 1), 
+                      labels = c("Low", "Medium", "High"),  
+                      name = "Feature Value\n(Scaled)") +  
+  scale_alpha_continuous(range = c(0.01, 0.2), guide = "none") +  
+  labs(title = "SHAP Beeswarm Plot",
+       x = "SHAP Value",
+       y = "Feature") +
+  theme_minimal() +
+  geom_quasirandom(orientation = "y") +
+  theme(legend.position = "right",
+        legend.key.height = unit(1.5, "cm"))  
+print(p_beeswarm)
+
+```
+In the beeswarm plot, each point represents a song. The color indicates the feature value (purple for low, yellow for high), and the horizontal position shows the feature’s impact (SHAP value). For instance, for `artist_popularity`, yellow dots cluster on the right, indicating that top artists like Taylor Swift (high `artist_popularity`) tend to receive higher track popularity (SHAP > 0), while purple dots on the left suggest newcomers (low `artist_popularity`) tend to receive lower track popularity (SHAP < 0).
+
+We further plot **SHAP value vs. Feature value** scatter plots below to show how specific features may contribute to track popularity predictions. 
+
+1. Audio features
+
+```{r}
+plot_shap_scatter <- function(feature_data, shap_data, feature_name = "release_yr") {
+  data <- data.table(
+    feature_value = feature_data[[feature_name]], 
+    shap_value = shap_data[[feature_name]]        
+  )
+  
+  p_scatter <- ggplot(data, aes(x = feature_value, y = shap_value, color = shap_value)) +
+    geom_point(alpha = 0.6, size = 2) +  
+    geom_smooth(formula = y ~ x, method = "loess", color = "#A0C9E6", se = TRUE) +  
+    scale_color_gradient2(low = "purple", mid = "white", high = "orange", midpoint = 0) + 
+    labs(
+         x = feature_name,
+         y = "SHAP Value") +
+    theme_minimal() +
+    theme(plot.caption = element_blank(),
+          axis.title.x = element_text(size = 8),
+          axis.title.y = element_text(size = 8),
+          axis.text.x = element_text(size = 6),
+          axis.text.y = element_text(size = 6)
+      ) +
+    guides(color = "none")
+  
+
+  return(p_scatter)
+}
+
+
+
+
+all_shap_values <- unlist(lapply(numeric_features, function(f) shap_data[[f]]))
+color_limits <- range(all_shap_values, na.rm = TRUE)
+
+
+plots <- lapply(numeric_features, function(f) {
+  plot_shap_scatter(train_data, shap_data, feature_name = f)
+})
+```
+
+
+```{r}
+grid.arrange(plots[[2]], plots[[4]], plots[[6]], plots[[9]], plots[[3]], plots[[5]], plots[[7]], plots[[8]], ncol = 4)
+```
+Take the feature `energy` as an example: at low levels, its SHAP values are positive, while at high levels, its SHAP values are negative. This indicates `energy` may be a strong negative contributor to popularity.
+
+Overall, positive contributors include `danceability`, `loudness`, and `acousticness`, while negative contributors are `energy`, `speechiness`, `instrumentalness`, and `liveness`. The contribution of `valence` is less clear. 
+
+
+For temporal features, `tempo` around 105 (moderately slow tracks) and above 150 (fast tracks) tend to boost popularity. Similarly, song duration of approximately 200 seconds (3 minutes 20 seconds, which is a short song) appears optimal for success. These findings basically align with the earlier EDA findings. 
+
+```{r out.width="60%", out.height="60%"}
+grid.arrange(plots[[10]], plots[[11]], ncol = 2)
+```
+
+2. Genre and release year
+
+- Genre: From the beeswarm plot, pop and Latin are clearly top positive contributors to popularity, while EDM is a negative contributor. Rock, rap and r&b fall in between.
+
+- Release year: 
+
+
+
+```{r include=TRUE, out.width="60%", out.height="60%"}
+
+plot_data <- data.table(
+  release_yr = train_data$release_yr,  
+  shap_value = shap_data[["release_yr"]], 
+  track_genre_edm = train_data$track_genre.edm, 
+  track_genre_latin = train_data$track_genre.latin,  
+  track_genre_pop = train_data$track_genre.pop,  
+  track_genre_r_and_b = train_data$`track_genre.r&b`,  
+  track_genre_rap = train_data$track_genre.rap,
+  track_genre_rock = train_data$track_genre.rock
+)
+
+
+plot_data$genre_color <- "grey"  
+
+plot_data[track_genre_r_and_b == 1, genre_color := "R&B"]
+plot_data[track_genre_latin == 1, genre_color := "Latin"]
+plot_data[track_genre_pop == 1, genre_color := "Pop"]
+plot_data[track_genre_edm == 1, genre_color := "EDM"]
+plot_data[track_genre_rap == 1, genre_color := "Rap"]
+plot_data[track_genre_rock == 1, genre_color := "Rock"]
+
+
+plot_data$genre_name <- factor(plot_data$genre_color, levels = c("R&B", "Latin", "Pop", "EDM", "Rap", "Rock"))
+
+
+p_scatter <- ggplot(plot_data, aes(x = release_yr, y = shap_value, color = genre_name)) +
+  geom_jitter(alpha = 0.4, size = 2, width = 0.5, height = 0.5) + 
+  scale_color_viridis_d(option = "plasma", begin = 0.05, end = 0.95) +
+  labs(
+    x = "Release Year",
+    y = "SHAP Value (for Release Year)",
+    color = "Track Genre"
+  ) +
+  theme_minimal() +
+  guides(color = guide_legend(title = "Track Genre"))
+print(p_scatter)
+```
+In this scatter plot, we further mark genre by different colors. Overall, SHAP values for `release_yr` show a U-shaped pattern, similar to EDA findings — both recent and older songs (pre-1980s) tend to be more popular, while around 2010s songs are less popular today. This aligns with two hypotheses: (1) Recency bias: Newer songs benefit from modern trends; (2) retro sentiment: Older songs, especially pre-1980s Rock and R&B, maintain enduring appeal.
+
+However, two critical questions remain: (1) Are older songs popular today due to inherent quality (survival bias), or is there a true nostalgia effect? (2) Is the retro sentiment stronger for Rock/R&B because these genres inherently age better? or just because they dominated the pre-1980s era?
+
+To answer them, Spotify could run a two-phase A/B test as described in Table 3:
+
+
+Table 3: A/B test experiment designs
+
+| **Phase** | **Objective**                          | **Groups**                                                                 | **Metrics**                                                                 | **Next Steps**                                                                 |
+|-----------|----------------------------------------|---------------------------------------------------------------------------|-----------------------------------------------------------------------------|--------------------------------------------------------------------------------|
+| Phase 1   | Validate retro sentiment: if 1980s songs outperform ~2010s songs | **Control:**<br>Original recommendation algorithm<br><br>**Treatment:**<br>Boost 1980s song exposure | play completion rate, save rate, etc.<br>               | If 1980s metrics are significantly better→ Proceed to Phase 2<br>Else → Halt. Review survival bias in popular old songs|
+| Phase 2   | Validate genre superiority in retro sentiment (1980s Rock/R&B vs. other 1980s genres) | **Control:**<br>Boost other 1980s genres<br><br>**Treatment:**<br>Boost 1980s Rock/R&B | play completion rate, save rate, etc. <br>             | If Rock/R&B wins → Prioritize Rock/R&B track licensing in contemporary tracks <br>Else → License 1980s tracks equally       |
+
+
+## 5. Conclusions
+
+### 5.1 Summary and Limitations
+Based on the 30000-Spotify-songs dataset, we conducted comprehensive EDA and predictive modeling to identify key factors influencing track popularity. The EDA revealed interesting relationships between musical features, release year, genre, and popularity, while the XGBoost model provided insights into the predictive power of these features through SHAP analysis.
+
+However, several limitations exist: the model's predictive capability is moderate, suggesting the need for more advanced techniques like deep learning based high-dimensional feature extraction. Additionally, artist-related metrics such as `artist_popularity` and `artist_followers` have time mismatch with track popularity data and thus require more robust measures. The SHAP analysis indicates "contributions" but not causality. Moreover, selection bias and imbalanced release year distribution need further addressing to enhance the robustness of the findings.
+
+### 5.2 Findings and Managerial Implications
+
+#### 5.2.1 For artists and music producers
+The analysis suggests that tracks with **major mode, tempo around 105bpm or higher than 150bpm, durations of 150-210 seconds, higher danceability, loudness, acousticness and lower energy, speechiness, instrumentalness and liveness** tend to achieve higher popularity. These findings provide a recipe for crafting popular songs. Conversely, post-2010 rock tracks, which deviate from these preferences, generally exhibit lower popularity. 
+
+#### 5.2.2 For streaming platforms
+The study highlights that **pop and Latin** genres perform well in terms of popularity, especially for songs released **after 2010**. It is recommended to prioritize promoting new songs in these genres. Additionally, songs released around 2010 tend to have lower popularity, while those **pre-1980s releases may benefit from a "retro sentiment", particularly in rock and R&B genres**. Further experimental validation is needed to confirm this effect. Corresponding strategies for license acquisition from label companies should be explored to capitalize on these insights.
+
